@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GoLLM</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="icon" href="logo.png" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header>
+    <div class="header-left">
+      <span class="logo">
+        <img src="logo.png" class="logo-img" alt="GoLLM" />
+        GoLLM
+      </span>
+      <span id="active-badge" class="badge badge-inactive">idle</span>
+    </div>
+    <div class="header-right">
+      <span id="ram-bar-label" class="ram-label">RAM —</span>
+      <div class="ram-bar-track">
+        <div id="ram-bar-fill" class="ram-bar-fill"></div>
+      </div>
+      <span id="conn-dot" class="conn-dot" title="connection status"></span>
+    </div>
+  </header>
+
+  <nav class="tabs">
+    <div class="tabs-track">
+      <div class="tab-indicator" id="tab-indicator"></div>
+      <button class="tab-btn active" data-tab="services">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>
+        Services
+      </button>
+      <button class="tab-btn" data-tab="models">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></svg>
+        Models
+      </button>
+      <button class="tab-btn" data-tab="sets">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="7" width="20" height="14" rx="2" ry="2"/><path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"/></svg>
+        Sets
+      </button>
+      <button class="tab-btn" data-tab="jobs">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+        Jobs
+      </button>
+      <button class="tab-btn" data-tab="status">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        Status
+      </button>
+    </div>
+  </nav>
+
+  <!-- ── Models tab ────────────────────────────────────────────── -->
+  <section id="tab-models" class="tab-pane">
+    <div class="pane-toolbar">
+      <h2>Models</h2>
+      <div style="display:flex;gap:.5rem">
+        <button class="btn-ghost" id="hf-token-btn" onclick="openHfTokenDialog()">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+          HF Token
+        </button>
+        <button class="btn-primary" onclick="openInstallDialog()">+ Install</button>
+      </div>
+    </div>
+    <div id="models-list" class="card-grid"><div class="loading">Fetching data</div></div>
+  </section>
+
+  <!-- ── Sets tab ──────────────────────────────────────────────── -->
+  <section id="tab-sets" class="tab-pane">
+    <div class="pane-toolbar">
+      <h2>Sets</h2>
+      <button class="btn-primary" onclick="openCreateSetDialog()">+ Create</button>
+    </div>
+    <div id="sets-list" class="card-grid"><div class="loading">Fetching data</div></div>
+  </section>
+
+  <!-- ── Jobs tab ──────────────────────────────────────────────── -->
+  <section id="tab-jobs" class="tab-pane">
+    <div class="pane-toolbar">
+      <h2>Jobs</h2>
+    </div>
+    <div id="jobs-list" class="card-grid"><div class="loading">Fetching data</div></div>
+  </section>
+
+  <!-- ── Services tab ──────────────────────────────────────────── -->
+  <section id="tab-services" class="tab-pane active">
+    <div class="pane-toolbar">
+      <h2>Compose Services</h2>
+      <button class="btn-ghost" onclick="refreshServices()">Refresh</button>
+    </div>
+    <div id="services-list" class="card-grid"><div class="loading">Fetching data</div></div>
+  </section>
+
+  <!-- ── Config tab ────────────────────────────────────────────── -->
+  <section id="tab-status" class="tab-pane">
+    <div class="pane-toolbar">
+      <h2>Status</h2>
+      <button class="btn-ghost" onclick="reloadConfig()">Reload config.yaml</button>
+    </div>
+    <div id="config-info" class="config-blocks"></div>
+  </section>
+
+  <!-- ── HF Token dialog ────────────────────────────────────────── -->
+  <dialog id="hf-token-dialog">
+    <h3>HuggingFace Token</h3>
+    <div class="dialog-form">
+      <div id="hf-token-status" style="font-size:.82rem;color:var(--text-sec);margin-bottom:.5rem"></div>
+      <label>Token <small>required for gated models (Gemma, Llama, etc.)</small>
+        <input id="hf-token-input" type="password" placeholder="hf_..." />
+      </label>
+    </div>
+    <div class="dialog-actions">
+      <button class="btn-danger btn-sm" onclick="removeHfToken()">Remove</button>
+      <div style="flex:1"></div>
+      <button class="btn-ghost" onclick="document.getElementById('hf-token-dialog').close()">Cancel</button>
+      <button class="btn-primary" onclick="saveHfToken()">Save</button>
+    </div>
+  </dialog>
+
+  <!-- ── Install dialog ────────────────────────────────────────── -->
+  <dialog id="install-dialog">
+    <h3>Install Model</h3>
+    <div class="dialog-form">
+      <label>Model name <small>e.g. qwen3.5, llama4</small><input id="inst-key" type="text" placeholder="my-model" /></label>
+      <label>Backend
+        <select id="inst-backend" onchange="onBackendChange()"></select>
+      </label>
+      <label id="inst-model-path-label">HuggingFace model <small>org/repo format</small><input id="inst-model-path" type="text" placeholder="Qwen/Qwen3.5-35B-A3B-FP8" /></label>
+      <label class="checkbox-label">
+        <input id="inst-download" type="checkbox" checked />
+        Download weights from HuggingFace
+      </label>
+    </div>
+    <div class="dialog-actions">
+      <button class="btn-ghost" onclick="document.getElementById('install-dialog').close()">Cancel</button>
+      <button class="btn-primary" onclick="submitInstall()">Install</button>
+    </div>
+  </dialog>
+
+  <!-- ── Create set dialog ─────────────────────────────────────── -->
+  <dialog id="create-set-dialog">
+    <h3>Create Set</h3>
+    <div class="dialog-form">
+      <label>Set name<input id="set-key" type="text" placeholder="e.g. coding-pair" /></label>
+      <label>Description <small>optional</small><input id="set-desc" type="text" placeholder="e.g. Models for code generation" /></label>
+      <label>Models <small>select which models run together</small></label>
+      <div id="set-model-checkboxes" class="set-model-list"></div>
+    </div>
+    <div class="dialog-actions">
+      <button class="btn-ghost" onclick="document.getElementById('create-set-dialog').close()">Cancel</button>
+      <button class="btn-primary" onclick="submitCreateSet()">Create</button>
+    </div>
+  </dialog>
+
+  <!-- ── Confirm start dialog ────────────────────────────────────── -->
+  <dialog id="confirm-start-dialog">
+    <h3>Start <span id="confirm-start-service"></span> directly?</h3>
+    <div class="confirm-warn">
+      <div class="confirm-warn-icon">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="var(--yellow)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+      </div>
+      <p id="confirm-start-ram"></p>
+    </div>
+    <div class="dialog-actions">
+      <button class="btn-ghost" onclick="document.getElementById('confirm-start-dialog').close()">Cancel</button>
+      <button class="btn-danger" onclick="confirmStartService()">Start anyway</button>
+    </div>
+  </dialog>
+
+  <!-- ── Log panel ──────────────────────────────────────────────── -->
+  <div id="log-panel" class="log-panel">
+    <div class="log-drag-handle" id="log-drag-handle"></div>
+    <div class="log-header">
+      <span class="log-title" id="log-title">Terminal</span>
+      <div class="log-controls">
+        <select id="log-source" onchange="switchLogSource()"></select>
+        <button class="btn-icon" onclick="clearLogs()" title="Clear">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+        </button>
+        <button class="btn-icon" onclick="toggleLogPanel()" title="Collapse" id="log-toggle">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
+        </button>
+      </div>
+    </div>
+    <div class="log-body" id="log-body"></div>
+    <button class="log-scroll-btn" id="log-scroll-btn" onclick="scrollToBottom()" style="display:none">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
+      New logs
+    </button>
+  </div>
+
+  <!-- ── Toast ─────────────────────────────────────────────────── -->
+  <div id="toast" class="toast"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>

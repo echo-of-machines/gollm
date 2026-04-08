@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<link rel="icon" href="logo.png" />
+<title>GoLLM — starting</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: #0e0f11;
+    color: #e2e4ea;
+    font-family: 'Inter', system-ui, -apple-system, sans-serif;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 100vh;
+    flex-direction: column;
+    gap: 1.5rem;
+  }
+  .spinner {
+    width: 48px; height: 48px;
+    border: 4px solid #2a2d35;
+    border-top-color: #5b8def;
+    border-radius: 50%;
+    animation: spin .8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .label { font-size: 1rem; color: #7a7f8e; }
+  .sub { font-size: .8rem; color: #4a4e5a; margin-top: -.5rem; }
+</style>
+</head>
+<body>
+  <div class="spinner"></div>
+  <div class="label">Starting GoLLM...</div>
+  <div class="sub" id="status">Waiting for health check</div>
+  <script>
+    let attempts = 0;
+    (function poll() {
+      attempts++;
+      document.getElementById('status').textContent = `Attempt ${attempts}...`;
+      fetch('/health').then(r => {
+        if (r.ok) {
+          document.getElementById('status').textContent = 'Ready!';
+          window.location.href = '/ui/';
+        } else {
+          setTimeout(poll, 500);
+        }
+      }).catch(() => setTimeout(poll, 500));
+    })();
+  </script>
+</body>
+</html>

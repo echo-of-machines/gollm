@@ -1,0 +1,18 @@
+# GoLLM configuration
+# Models are registered here automatically when installed via the GUI or API.
+# You can also add them manually below.
+
+models: {}
+
+# sets:
+#   my-set:
+#     members: [model-a, model-b]
+#     primary: model-a
+#     aliases: [my-set]
+
+router:
+  health_poll_interval: 2
+  in_flight_drain_timeout: 120
+  model_hold_seconds: 15
+  compose_project: gollm
+  default_model:

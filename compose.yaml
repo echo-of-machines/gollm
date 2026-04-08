@@ -1,0 +1,56 @@
+name: gollm
+
+services:
+  model-router:
+    build:
+      context: ./model-router
+      dockerfile: Dockerfile
+    ports:
+      - "${GOLLM_PORT:-30000}:30000"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./compose.yaml:/workbench/compose.yaml:rw
+      - ./model-router/config.yaml:/app/config.yaml
+      - ./model-router/static:/app/static:ro
+      - huggingface-cache:/root/.cache/huggingface
+    environment:
+      - HF_TOKEN=${HF_TOKEN:-}
+      - HF_HOME=/root/.cache/huggingface
+    restart: unless-stopped
+
+  # ── Example model services ─────────────────────────────────────
+  # Models below are examples. Install new models via the GUI
+  # (Models tab → + Install) or the API. These are managed by
+  # GoLLM and started on-demand with --profile models.
+  #
+  # To add a model manually, copy an example below and adjust
+  # the image, command, and model-path for your model.
+
+  # sglang-example:
+  #   profiles: ["models"]
+  #   image: lmsysorg/sglang:latest
+  #   expose: ["30000"]
+  #   volumes:
+  #     - huggingface-cache:/root/.cache/huggingface
+  #     - pip-cache:/root/.cache/pip
+  #   environment:
+  #     - HF_HOME=/root/.cache/huggingface
+  #     - HF_TOKEN=${HF_TOKEN:-}
+  #   command: >
+  #     python -m sglang.launch_server
+  #     --model-path org/model-name
+  #     --host 0.0.0.0 --port 30000
+  #     --trust-remote-code
+  #   deploy:
+  #     resources:
+  #       reservations:
+  #         devices:
+  #           - driver: nvidia
+  #             count: all
+  #             capabilities: [gpu]
+  #   shm_size: '16gb'
+  #   restart: "no"
+
+volumes:
+  huggingface-cache:
+  pip-cache:

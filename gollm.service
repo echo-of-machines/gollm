@@ -1,0 +1,27 @@
+[Unit]
+Description=GoLLM — multi-backend LLM container manager
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Update WorkingDirectory to your GoLLM installation path
+WorkingDirectory=/opt/gollm
+
+# Start: bring up GoLLM router only (backends loaded on-demand)
+ExecStart=/usr/bin/docker compose up -d --build model-router
+
+# Stop: graceful shutdown of all services in the project
+ExecStop=/usr/bin/docker compose down --timeout 30
+
+TimeoutStartSec=120
+TimeoutStopSec=60
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=gollm
+
+[Install]
+WantedBy=multi-user.target

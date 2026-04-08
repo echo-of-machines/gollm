@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 240">
+  <defs>
+    <linearGradient id="branch-top" x1="0%" y1="50%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#5b8def"/>
+      <stop offset="100%" stop-color="#a78bfa"/>
+    </linearGradient>
+    <linearGradient id="branch-mid" x1="0%" y1="50%" x2="100%" y2="50%">
+      <stop offset="0%" stop-color="#5b8def"/>
+      <stop offset="100%" stop-color="#8b7cf7"/>
+    </linearGradient>
+    <linearGradient id="branch-bot" x1="0%" y1="50%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#5b8def"/>
+      <stop offset="100%" stop-color="#6ba3ff"/>
+    </linearGradient>
+  </defs>
+  <!-- Top branch curve -->
+  <path d="M 88 108 C 120 108, 130 65, 172 58" stroke="url(#branch-top)" stroke-width="16" stroke-linecap="round" fill="none"/>
+  <!-- Middle branch -->
+  <path d="M 88 120 C 120 120, 140 120, 172 120" stroke="url(#branch-mid)" stroke-width="16" stroke-linecap="round" fill="none"/>
+  <!-- Bottom branch curve -->
+  <path d="M 88 132 C 120 132, 130 175, 172 182" stroke="url(#branch-bot)" stroke-width="16" stroke-linecap="round" fill="none"/>
+  <!-- Endpoint circles -->
+  <circle cx="178" cy="55" r="18" fill="#a78bfa"/>
+  <circle cx="178" cy="120" r="18" fill="#8b7cf7"/>
+  <circle cx="178" cy="185" r="18" fill="#5b8def"/>
+  <!-- Input ring (white) -->
+  <circle cx="68" cy="120" r="30" fill="none" stroke="white" stroke-width="16"/>
+</svg>
