@@ -281,6 +281,7 @@ updateHfTokenBtn();
 async function openInstallDialog() {
   document.getElementById('inst-key').value = '';
   document.getElementById('inst-model-path').value = '';
+  document.getElementById('inst-image').value = '';
   document.getElementById('inst-download').checked = true;
 
   // Populate backend dropdown
@@ -305,12 +306,15 @@ function onBackendChange() {
   const input = document.getElementById('inst-model-path');
   label.childNodes[0].textContent = b.model_path_label + ' ';
   input.placeholder = b.model_path_placeholder || '';
+  // Show/hide Docker image field for custom backend
+  document.getElementById('inst-image-label').style.display = b.custom ? '' : 'none';
 }
 
 async function submitInstall() {
   const key       = document.getElementById('inst-key').value.trim();
   const backend   = document.getElementById('inst-backend').value;
   const modelPath = document.getElementById('inst-model-path').value.trim();
+  const image     = document.getElementById('inst-image').value.trim();
   const download  = document.getElementById('inst-download').checked;
 
   if (!key)       { toast('Model name is required', 'err'); return; }
@@ -318,23 +322,28 @@ async function submitInstall() {
   if (/[^a-zA-Z0-9._-]/.test(key)) { toast('Model name: letters, numbers, dots, dashes only', 'err'); return; }
 
   const b = _backends.find(x => x.key === backend);
+  if (b && b.custom && !image) { toast('Docker image is required for custom backend', 'err'); return; }
+
   const port = b ? b.port : 30000;
   const service = `${backend}-${key}`;
   const aliases = [key, modelPath];
   const parts = modelPath.split('/');
   if (parts.length > 1) aliases.push(parts[parts.length - 1]);
 
+  const payload = {
+    key,
+    backend,
+    service,
+    model_path: modelPath,
+    base_url: `http://${service}:${port}`,
+    ram_required_gb: 0,
+    aliases,
+    download,
+  };
+  if (image) payload.image = image;
+
   try {
-    const result = await POST('/router/models/install', {
-      key,
-      backend,
-      service,
-      model_path: modelPath,
-      base_url: `http://${service}:${port}`,
-      ram_required_gb: 0,
-      aliases,
-      download,
-    });
+    const result = await POST('/router/models/install', payload);
     document.getElementById('install-dialog').close();
     toast(`${key} installed${result.download_job_id ? ' — download started' : ''}`, 'ok');
     refreshModels();

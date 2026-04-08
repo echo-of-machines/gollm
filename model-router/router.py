@@ -173,15 +173,33 @@ BACKEND_TEMPLATES: dict[str, dict] = {
         "model_path_label": "HuggingFace model",
         "model_path_placeholder": "meta-llama/Llama-4-Scout-17B-16E-Instruct",
     },
+    "custom": {
+        "label": "Custom",
+        "image": "",
+        "port": 8000,
+        "command_template": None,
+        "environment": [
+            "HF_HOME=/root/.cache/huggingface",
+        ],
+        "gpu": True,
+        "hf_cache": True,
+        "shm_size": "16gb",
+        "model_path_label": "Model identifier",
+        "model_path_placeholder": "org/model-name or model:tag",
+        "custom": True,
+    },
 }
 
 
-def _build_compose_service(backend: str, model_path: str) -> dict:
+def _build_compose_service(backend: str, model_path: str, image_override: str = "") -> dict:
     """Generate a Docker Compose service dict from a backend template."""
     tpl = BACKEND_TEMPLATES[backend]
+    image = image_override or tpl["image"]
+    if not image:
+        raise ValueError(f"Docker image is required for backend '{backend}'")
     svc: dict = {
         "profiles": ["models"],
-        "image": tpl["image"],
+        "image": image,
         "expose": [str(tpl["port"])],
         "restart": "no",
     }
@@ -1140,6 +1158,7 @@ async def list_backends():
             "port": tpl["port"],
             "model_path_label": tpl.get("model_path_label", "Model path"),
             "model_path_placeholder": tpl.get("model_path_placeholder", ""),
+            "custom": tpl.get("custom", False),
         })
     return {"backends": backends}
 
@@ -1253,8 +1272,12 @@ async def install_model(request: Request):
         body["base_url"] = f"http://{service_name}:{port}"
 
     # Auto-generate compose service from backend template if not explicitly provided
+    image_override = body.get("image", "")
     if not compose_service_def and backend in BACKEND_TEMPLATES and model_path:
-        compose_service_def = _build_compose_service(backend, model_path)
+        try:
+            compose_service_def = _build_compose_service(backend, model_path, image_override)
+        except ValueError as e:
+            return JSONResponse(status_code=400, content={"error": str(e)})
 
     # Build the registration closure (compose + config writes)
     model_entry = {k: v for k, v in body.items()
