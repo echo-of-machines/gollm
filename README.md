@@ -1,19 +1,51 @@
 # GoLLM
 
-**Multi-backend local LLM container manager with browser GUI.**
+**Intelligent LLM model router with automatic lifecycle management.**
 
-GoLLM manages local LLM inference containers through a single OpenAI-compatible API endpoint. Install models from HuggingFace, swap between them with one click, and monitor everything from a browser dashboard.
+GoLLM is a smart routing proxy that sits between your applications and local LLM inference backends. Send any OpenAI-compatible request to `localhost:30000` — GoLLM automatically loads the right model, manages container lifecycle, and proxies the request. No manual container management needed.
+
+**The problem:** Running multiple local LLMs means juggling Docker containers, managing GPU memory, and manually stopping one model before starting another. Every tool that needs a local LLM has to know which model is running and on what port.
+
+**GoLLM's solution:** One endpoint, any model. Your apps always talk to `localhost:30000`. GoLLM handles everything behind that — which model to load, when to swap, draining in-flight requests, checking RAM, starting containers, polling health, and routing traffic.
+
+## Key Feature: Smart Model Router
+
+```
+App sends: {"model": "nemotron-nano", "messages": [...]}
+                     │
+                     ▼
+              GoLLM Router (:30000)
+              ┌──────────────────┐
+              │ "nemotron-nano   │
+              │  is not active,  │
+              │  qwen3.5 is.     │
+              │                  │
+              │  1. Drain qwen   │
+              │  2. Stop qwen    │
+              │  3. Start nemo   │
+              │  4. Health check │
+              │  5. Proxy request│
+              └──────────────────┘
+                     │
+                     ▼
+           Response from nemotron-nano
+```
+
+The router resolves model names through aliases (e.g. `nemotron`, `nemotron-nano`, `nemotron-30b`, and `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8` all route to the same backend), checks available RAM before loading, drains in-flight requests before swapping, and manages the full container lifecycle — all transparently to the caller.
 
 ## Features
 
+- **Intelligent model router** — auto-loads the requested model, swaps between models transparently
 - **Multi-backend** — SGLang, vLLM, and Custom Docker image support
-- **One-click model swap** — stop current model, start new one, route traffic automatically
+- **RAM-aware swapping** — checks `/proc/meminfo` before loading, prevents OOM
+- **In-flight request draining** — waits for active requests to complete before swapping
+- **Alias resolution** — multiple names can point to the same model
 - **Browser GUI** — manage services, models, sets, and jobs from `http://localhost:30000/ui/`
 - **Live terminal** — WebSocket-powered Docker log streaming in the browser
-- **RAM-aware** — checks available memory before loading models to prevent OOM
-- **OpenAI-compatible API** — drop-in replacement at `/v1/chat/completions`
-- **HuggingFace integration** — download models directly, with in-app token management
+- **OpenAI-compatible API** — drop-in replacement, works with any OpenAI client library
+- **HuggingFace integration** — download gated models directly, with in-app token management
 - **Model sets** — group models to run simultaneously with combined RAM checks
+- **Compose orchestration** — installs write Docker Compose services automatically
 
 ## Quick Start
 
