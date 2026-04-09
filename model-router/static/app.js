@@ -54,7 +54,12 @@ async function api(method, path, body) {
   }
   const r = await fetch(path, opts);
   const data = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(data.error?.message || data.error || `HTTP ${r.status}`);
+  if (!r.ok) {
+    const err = new Error(data.error?.message || data.error || `HTTP ${r.status}`);
+    err.status = r.status;
+    err.body = data;
+    throw err;
+  }
   return data;
 }
 const GET    = p       => api('GET',    p);
@@ -76,10 +81,14 @@ function toast(msg, type = 'ok') {
 function chip(label, cls) {
   return `<span class="chip chip-${cls}">${label}</span>`;
 }
-function containerChip(status) {
-  if (status === 'running')   return chip('running',   'running');
-  if (status === 'exited')    return chip('stopped',   'exited');
-  if (status === 'not_found') return chip('offline',   'not_found');
+function containerChip(status, healthy, downloading) {
+  if (status === 'running') {
+    if (healthy)              return chip('ready',       'ready');
+    if (downloading)          return chip('downloading', 'downloading');
+    return                           chip('loading',     'loading');
+  }
+  if (status === 'exited')    return chip('stopped',     'exited');
+  if (status === 'not_found') return chip('not installed','not_found');
   return chip(status, 'pending');
 }
 function jobChip(status) {
@@ -156,7 +165,7 @@ async function refreshModels() {
           <div class="card-chips">
             ${isLoadingThis && m.container_status === 'running' && !m.active
               ? chip('starting', 'running-job')
-              : containerChip(m.container_status)}
+              : containerChip(m.container_status, m.healthy, m.downloading)}
             ${m.active ? chip('active', 'active') : m.in_active_set ? chip('in set', 'active') : ''}
           </div>
         </div>
@@ -206,7 +215,20 @@ async function modelAction(key, action) {
     await POST(`/router/models/${key}/${action}`);
     toast(`${key}: ${action} OK`, 'ok');
     refreshModels();
-  } catch (e) { toast(`${action} failed: ${e.message}`, 'err'); }
+  } catch (e) {
+    if (e.status === 409) {
+      const msg = e.body?.error?.message || e.body?.error?.details?.message || 'A download is in progress.';
+      showWarnModal(`Cannot ${action} ${key}`, msg, `Force ${action}`, async () => {
+        try {
+          await POST(`/router/models/${key}/${action}?force=true`);
+          toast(`${key}: ${action} (forced) OK`, 'ok');
+          refreshModels();
+        } catch (e2) { toast(`Force ${action} failed: ${e2.message}`, 'err'); }
+      });
+    } else {
+      toast(`${action} failed: ${e.message}`, 'err');
+    }
+  }
 }
 
 async function uninstallModel(key) {
@@ -282,6 +304,7 @@ async function openInstallDialog() {
   document.getElementById('inst-key').value = '';
   document.getElementById('inst-model-path').value = '';
   document.getElementById('inst-image').value = '';
+  document.getElementById('inst-command').value = '';
   document.getElementById('inst-download').checked = true;
 
   // Populate backend dropdown
@@ -306,8 +329,9 @@ function onBackendChange() {
   const input = document.getElementById('inst-model-path');
   label.childNodes[0].textContent = b.model_path_label + ' ';
   input.placeholder = b.model_path_placeholder || '';
-  // Show/hide Docker image field for custom backend
+  // Show/hide Docker image and command fields for custom backend
   document.getElementById('inst-image-label').style.display = b.custom ? '' : 'none';
+  document.getElementById('inst-command-label').style.display = b.custom ? '' : 'none';
 }
 
 async function submitInstall() {
@@ -315,6 +339,7 @@ async function submitInstall() {
   const backend   = document.getElementById('inst-backend').value;
   const modelPath = document.getElementById('inst-model-path').value.trim();
   const image     = document.getElementById('inst-image').value.trim();
+  const command   = document.getElementById('inst-command').value.trim();
   const download  = document.getElementById('inst-download').checked;
 
   if (!key)       { toast('Model name is required', 'err'); return; }
@@ -341,6 +366,7 @@ async function submitInstall() {
     download,
   };
   if (image) payload.image = image;
+  if (command) payload.command = command;
 
   try {
     const result = await POST('/router/models/install', payload);
@@ -454,7 +480,20 @@ async function setAction(key, action) {
     await POST(`/router/sets/${key}/${action}`);
     toast(`Set ${key}: ${action} OK`, 'ok');
     refreshSets();
-  } catch (e) { toast(`${action} failed: ${e.message}`, 'err'); }
+  } catch (e) {
+    if (e.status === 409) {
+      const msg = e.body?.error?.message || 'A download is in progress.';
+      showWarnModal(`Cannot ${action} set ${key}`, msg, `Force ${action}`, async () => {
+        try {
+          await POST(`/router/sets/${key}/${action}?force=true`);
+          toast(`Set ${key}: ${action} (forced) OK`, 'ok');
+          refreshSets();
+        } catch (e2) { toast(`Force ${action} failed: ${e2.message}`, 'err'); }
+      });
+    } else {
+      toast(`${action} failed: ${e.message}`, 'err');
+    }
+  }
 }
 
 async function deleteSet(key) {
@@ -524,7 +563,7 @@ async function refreshServices() {
             <div class="card-subtitle">${esc(s.image)}</div>
           </div>
           <div class="card-chips">
-            ${containerChip(s.status)}
+            ${containerChip(s.status, s.healthy, s.downloading)}
           </div>
         </div>
         <div class="card-meta">
@@ -545,6 +584,17 @@ async function refreshServices() {
 // Cache last system state for RAM display in confirmation
 let _lastSystem = null;
 
+// Generic warning modal — replaces native confirm() for consistent UI
+function showWarnModal(title, message, btnLabel, onConfirm) {
+  const dlg = document.getElementById('confirm-warn-dialog');
+  document.getElementById('confirm-warn-title').textContent = title;
+  document.getElementById('confirm-warn-message').innerHTML = message;
+  const btn = document.getElementById('confirm-warn-btn');
+  btn.textContent = btnLabel;
+  btn.onclick = () => { dlg.close(); onConfirm(); };
+  dlg.showModal();
+}
+
 async function svcAction(service, action) {
   // For start actions on sglang services, show OOM warning
   if (action === 'start' && service.startsWith('sglang')) {
@@ -559,29 +609,39 @@ async function svcAction(service, action) {
       if (match) modelRAM = match.ram_required_gb;
     } catch {}
 
-    const dlg = document.getElementById('confirm-start-dialog');
-    document.getElementById('confirm-start-service').textContent = service;
-    document.getElementById('confirm-start-ram').innerHTML =
+    showWarnModal(
+      `Start ${service} directly?`,
       `This service requires <strong>~${modelRAM} GB</strong> RAM. ` +
       `Currently <strong>${availGB} GB</strong> of ${totalGB} GB available.` +
       `<br><br>Starting directly bypasses the router's RAM check and swap logic. ` +
       `If another model is already loaded, this may cause an <strong>OOM crash</strong>.` +
-      `<br><br>Use <strong>Load</strong> on the Models tab for safe, managed startup.`;
-    dlg._pendingService = service;
-    dlg.showModal();
+      `<br><br>Use <strong>Load</strong> on the Models tab for safe, managed startup.`,
+      'Start anyway',
+      () => confirmStartService(service),
+    );
     return;
   }
   try {
     await POST(`/router/services/${service}/${action}`);
     toast(`${service}: ${action} OK`, 'ok');
     refreshServices();
-  } catch (e) { toast(`${action} failed: ${e.message}`, 'err'); }
+  } catch (e) {
+    if (e.status === 409) {
+      const msg = e.body?.error?.message || 'A download is in progress.';
+      showWarnModal(`Cannot ${action} ${service}`, msg, `Force ${action}`, async () => {
+        try {
+          await POST(`/router/services/${service}/${action}?force=true`);
+          toast(`${service}: ${action} (forced) OK`, 'ok');
+          refreshServices();
+        } catch (e2) { toast(`Force ${action} failed: ${e2.message}`, 'err'); }
+      });
+    } else {
+      toast(`${action} failed: ${e.message}`, 'err');
+    }
+  }
 }
 
-async function confirmStartService() {
-  const dlg = document.getElementById('confirm-start-dialog');
-  const service = dlg._pendingService;
-  dlg.close();
+async function confirmStartService(service) {
   try {
     await POST(`/router/services/${service}/start`);
     toast(`${service}: start OK`, 'ok');

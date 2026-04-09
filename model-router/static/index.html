@@ -132,6 +132,9 @@
       <label id="inst-image-label" style="display:none">Docker image <small>e.g. vllm/vllm-openai:gemma4-cu130</small>
         <input id="inst-image" type="text" placeholder="org/image:tag" />
       </label>
+      <label id="inst-command-label" style="display:none">Command <small>override container entrypoint/cmd</small>
+        <input id="inst-command" type="text" placeholder="e.g. python -m sglang.launch_server --model-path {model_path} --host 0.0.0.0 --port 8000" />
+      </label>
       <label id="inst-model-path-label">HuggingFace model <small>org/repo format</small><input id="inst-model-path" type="text" placeholder="Qwen/Qwen3.5-35B-A3B-FP8" /></label>
       <label class="checkbox-label">
         <input id="inst-download" type="checkbox" checked />
@@ -159,18 +162,18 @@
     </div>
   </dialog>
 
-  <!-- ── Confirm start dialog ────────────────────────────────────── -->
-  <dialog id="confirm-start-dialog">
-    <h3>Start <span id="confirm-start-service"></span> directly?</h3>
+  <!-- ── Generic warning confirm dialog ────────────────────────────── -->
+  <dialog id="confirm-warn-dialog">
+    <h3 id="confirm-warn-title">Are you sure?</h3>
     <div class="confirm-warn">
       <div class="confirm-warn-icon">
         <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="var(--yellow)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
       </div>
-      <p id="confirm-start-ram"></p>
+      <p id="confirm-warn-message"></p>
     </div>
     <div class="dialog-actions">
-      <button class="btn-ghost" onclick="document.getElementById('confirm-start-dialog').close()">Cancel</button>
-      <button class="btn-danger" onclick="confirmStartService()">Start anyway</button>
+      <button class="btn-ghost" onclick="document.getElementById('confirm-warn-dialog').close()">Cancel</button>
+      <button class="btn-danger" id="confirm-warn-btn">Proceed</button>
     </div>
   </dialog>
 

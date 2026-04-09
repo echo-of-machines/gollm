@@ -279,6 +279,12 @@ header {
   border-radius: 50%;
   flex-shrink: 0;
 }
+.chip-ready    { background: var(--green-dim); color: var(--green); }
+.chip-ready::before    { background: var(--green); }
+.chip-downloading { background: var(--accent-bg); color: var(--accent); }
+.chip-downloading::before { background: var(--accent); animation: pulse 1s ease infinite; }
+.chip-loading  { background: var(--yellow-dim); color: var(--yellow); }
+.chip-loading::before  { background: var(--yellow); animation: pulse 1s ease infinite; }
 .chip-running  { background: var(--green-dim); color: var(--green); }
 .chip-running::before  { background: var(--green); }
 .chip-exited   { background: var(--yellow-dim); color: var(--yellow); }

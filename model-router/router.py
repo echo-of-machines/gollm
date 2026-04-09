@@ -45,6 +45,17 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 # ---------------------------------------------------------------------------
+# Exceptions
+# ---------------------------------------------------------------------------
+
+class SwapBlockedError(Exception):
+    """Raised when a swap is rejected (download in progress, cooldown, etc.)."""
+    def __init__(self, details: dict):
+        self.details = details
+        super().__init__(details.get("message", "Swap blocked"))
+
+
+# ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
 
@@ -64,6 +75,7 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("model-router")
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # ---------------------------------------------------------------------------
 # Config
@@ -159,7 +171,7 @@ BACKEND_TEMPLATES: dict[str, dict] = {
         "image": "vllm/vllm-openai:latest",
         "port": 8000,
         "command_template": (
-            "vllm serve {model_path}"
+            "{model_path}"
             " --host 0.0.0.0 --port 8000"
             " --trust-remote-code"
         ),
@@ -191,7 +203,9 @@ BACKEND_TEMPLATES: dict[str, dict] = {
 }
 
 
-def _build_compose_service(backend: str, model_path: str, image_override: str = "") -> dict:
+def _build_compose_service(
+    backend: str, model_path: str, image_override: str = "", command_override: str = "",
+) -> dict:
     """Generate a Docker Compose service dict from a backend template."""
     tpl = BACKEND_TEMPLATES[backend]
     image = image_override or tpl["image"]
@@ -203,7 +217,9 @@ def _build_compose_service(backend: str, model_path: str, image_override: str = 
         "expose": [str(tpl["port"])],
         "restart": "no",
     }
-    if tpl.get("command_template"):
+    if command_override:
+        svc["command"] = command_override.format(model_path=model_path)
+    elif tpl.get("command_template"):
         svc["command"] = tpl["command_template"].format(model_path=model_path)
     if tpl.get("environment"):
         svc["environment"] = list(tpl["environment"])
@@ -249,15 +265,16 @@ def container_name(service: str) -> str:
 @dataclasses.dataclass
 class Job:
     id: str
-    type: str                     # "hf-download"
+    type: str                     # "hf-download" | "container-download" | "image-pull"
     status: str                   # "pending" | "running" | "done" | "failed" | "cancelled"
     progress: float = 0.0         # 0.0–100.0
     message: str = ""
     result: Optional[dict] = None
     cancel_event: asyncio.Event = dataclasses.field(default_factory=asyncio.Event)
+    container: str = ""           # container name for synthetic jobs (stop on cancel)
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "id": self.id,
             "type": self.type,
             "status": self.status,
@@ -265,6 +282,9 @@ class Job:
             "message": self.message,
             "result": self.result,
         }
+        if self.container:
+            d["container"] = self.container
+        return d
 
 
 JOB_REGISTRY: dict[str, Job] = {}
@@ -411,6 +431,75 @@ in_flight_zero.set()
 
 swap_lock = asyncio.Lock()            # serialises all swap operations
 
+_last_swap_failure: dict[str, float] = {}   # model_key -> monotonic time of last failure
+SWAP_FAILURE_COOLDOWN: float = 30.0         # seconds to wait before retrying a failed swap
+
+# ---------------------------------------------------------------------------
+# Background health poller — industry-standard approach
+# ---------------------------------------------------------------------------
+# A background task probes all running containers on a fixed interval and
+# caches results. List/status endpoints read this cache (instant, no I/O).
+# Swap/lifecycle operations bypass the cache and probe directly.
+
+_model_state_cache: dict[str, dict] = {}  # model_key -> {healthy, downloading, container_status, last_update}
+POLLER_INTERVAL: float = 10.0             # seconds between poller cycles
+
+
+def get_cached_model_state(key: str) -> dict | None:
+    """Read poller cache for a model. Returns None if not cached or stale (>60s)."""
+    entry = _model_state_cache.get(key)
+    if entry and (time.monotonic() - entry["last_update"]) < 60.0:
+        return entry
+    return None
+
+
+async def _background_health_poller():
+    """Periodically probe all model containers and cache their state.
+
+    State transition rules:
+    - healthy → downloading is INVALID (a serving model can't start downloading)
+    - healthy → loading is OK (briefly unhealthy during shutdown/restart)
+    - stopped/not_found → downloading is OK (fresh start with missing weights)
+    """
+    while True:
+        try:
+            for key, info in MODELS_CFG.items():
+                cname = container_name(info["service"])
+                cstatus = await container_status(cname)
+                healthy = False
+                downloading = False
+
+                if cstatus == "running":
+                    try:
+                        resp = await http_client.get(
+                            f"{model_base_url(key)}/health", timeout=5.0
+                        )
+                        healthy = resp.status_code == 200
+                    except Exception:
+                        pass
+                    if not healthy:
+                        # Check previous state — don't flip from healthy to downloading
+                        prev = _model_state_cache.get(key)
+                        was_healthy = prev and prev.get("healthy", False)
+                        if not was_healthy:
+                            loop = asyncio.get_event_loop()
+                            dl = await loop.run_in_executor(
+                                None, lambda cn=cname: _detect_container_download_sync(cn)
+                            )
+                            downloading = dl is not None
+
+                # Atomic update
+                _model_state_cache[key] = {
+                    "healthy": healthy,
+                    "downloading": downloading,
+                    "container_status": cstatus,
+                    "last_update": time.monotonic(),
+                }
+        except Exception as e:
+            log.error("Health poller error: %s", e)
+
+        await asyncio.sleep(POLLER_INTERVAL)
+
 # Module-level httpx client (connection pooled, created in lifespan)
 http_client: Optional[httpx.AsyncClient] = None
 docker_client: Optional[docker.DockerClient] = None
@@ -508,7 +597,8 @@ async def restart_container(name: str) -> None:
 
 async def _compose_up_service(service: str) -> None:
     """Fallback: create + start a service via docker compose CLI.
-    Automatically detects and passes --profile flags for profile-gated services."""
+    Automatically detects and passes --profile flags for profile-gated services.
+    Creates a synthetic 'image-pull' job if a Docker image pull is detected."""
     try:
         with open(COMPOSE_PATH) as f:
             compose = yaml.safe_load(f)
@@ -526,35 +616,226 @@ async def _compose_up_service(service: str) -> None:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await proc.communicate()
+
+    # Read stderr line by line to detect image pulls
+    pull_job: Job | None = None
+    stderr_lines: list[bytes] = []
+    while True:
+        line = await proc.stderr.readline()
+        if not line:
+            break
+        stderr_lines.append(line)
+        decoded = line.decode("utf-8", errors="replace").strip()
+        if pull_job is None and ("Pulling" in decoded or "Downloading" in decoded):
+            pull_job = _new_job("image-pull")
+            pull_job.status = "running"
+            pull_job.message = f"Pulling Docker image for service {service}"
+            log.info("Image pull detected for service %s — created job %s",
+                     service, pull_job.id[:8])
+
+    await proc.wait()
+
+    if pull_job:
+        if proc.returncode == 0:
+            pull_job.status = "done"
+            pull_job.progress = 100.0
+            pull_job.message += " — complete"
+        else:
+            pull_job.status = "failed"
+            pull_job.message += " — failed"
+
     if proc.returncode != 0:
+        stderr_text = b"".join(stderr_lines).decode("utf-8", errors="replace")[:500]
         raise RuntimeError(
-            f"compose up failed (rc={proc.returncode}): {stderr.decode()[:500]}"
+            f"compose up failed (rc={proc.returncode}): {stderr_text}"
         )
     log.info("compose up succeeded for service %s", service)
+
+# ---------------------------------------------------------------------------
+# Container discovery — Docker as ground truth
+# ---------------------------------------------------------------------------
+
+
+def _discover_running_containers_sync() -> dict[str, dict]:
+    """Scan all configured model containers via Docker and return their real state.
+
+    Returns {model_key: {container, service, downloading, active_logs}} for
+    containers that are actually running.  Only checks models in MODELS_CFG.
+    """
+    result: dict[str, dict] = {}
+    for key, info in MODELS_CFG.items():
+        cname = container_name(info["service"])
+        try:
+            container = docker_client.containers.get(cname)
+            if container.status != "running":
+                continue
+            downloading = _detect_container_download_sync(cname) is not None
+            active_logs = _container_has_recent_activity_sync(cname)
+            result[key] = {
+                "container": cname,
+                "service": info["service"],
+                "downloading": downloading,
+                "active_logs": active_logs,
+            }
+        except docker.errors.NotFound:
+            continue
+        except Exception as e:
+            log.warning("Error inspecting container %s: %s", cname, e)
+            continue
+    return result
+
+
+async def discover_running_containers() -> dict[str, dict]:
+    """Async wrapper for _discover_running_containers_sync."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _discover_running_containers_sync)
+
 
 # ---------------------------------------------------------------------------
 # SGLang API calls
 # ---------------------------------------------------------------------------
 
 
+def _is_model_cached_sync(model_path: str, cache_dir: str = "/root/.cache/huggingface") -> bool:
+    """Returns True if the model weights are already in the HF cache."""
+    try:
+        from huggingface_hub import snapshot_download
+        snapshot_download(repo_id=model_path, cache_dir=cache_dir, local_files_only=True)
+        return True
+    except Exception:
+        return False
 
-async def poll_health(base_url: str, timeout: float) -> bool:
-    """Poll base_url/health until 200 or timeout. Returns True if healthy."""
-    deadline = time.monotonic() + timeout
+
+def _detect_container_download_sync(cname: str) -> str | None:
+    """Detect if a running model container is actively downloading weights.
+
+    Only returns a model_path if the container is RUNNING and the model
+    weights are not fully cached.  A stopped container with incomplete
+    cache is not "downloading" — it's just "not fully downloaded".
+
+    Returns model_path string if actively downloading, None otherwise.
+    """
+    # Verify the container is actually running
+    try:
+        container = docker_client.containers.get(cname)
+        if container.status != "running":
+            return None
+    except Exception:
+        return None
+
+    # Find which model config this container belongs to
+    model_path = None
+    for key, info in MODELS_CFG.items():
+        if container_name(info["service"]) == cname:
+            model_path = info.get("model_path")
+            break
+
+    if model_path:
+        # Primary: check HF cache — if not cached and container is running,
+        # it must be downloading
+        if not _is_model_cached_sync(model_path):
+            return model_path
+
+    # Fallback: check logs for download activity
+    try:
+        logs = container.logs(tail=200).decode("utf-8", errors="replace").lower()
+        if ("download" in logs and ("attempt" in logs or "missing" in logs or "incomplete" in logs)):
+            return model_path or "unknown"
+    except Exception:
+        pass
+
+    return None
+
+
+def _container_has_recent_activity_sync(cname: str, since_seconds: int = 5) -> bool:
+    """Returns True if the container logged anything in the last N seconds."""
+    try:
+        container = docker_client.containers.get(cname)
+        since_ts = int(time.time()) - since_seconds
+        logs = container.logs(tail=5, since=since_ts)
+        return bool(logs.strip())
+    except Exception:
+        return False
+
+
+async def poll_health(base_url: str, timeout: float, container_name: str | None = None) -> bool:
+    """Poll base_url/health until 200 or timeout.
+
+    If container_name is given, the deadline is extended while the container
+    is actively logging (e.g. downloading weights, loading model). The health
+    check only hard-fails if the container goes quiet for STALL_TIMEOUT seconds
+    without becoming healthy — indicating a genuine stuck/crashed state.
+
+    If an in-container HF download is detected, a synthetic job is created so
+    the download is visible on the Jobs page even when it wasn't initiated by
+    the router's install flow.
+    """
+    STALL_TIMEOUT = 300.0  # seconds of log silence before declaring failure
+
+    start = time.monotonic()
+    deadline = start + timeout
+    last_activity = start
+    synthetic_job: Job | None = None
+    download_checked = False
     log.info("Health polling %s/health (timeout=%.0fs)...", base_url, timeout)
-    while time.monotonic() < deadline:
+
+    while True:
+        now = time.monotonic()
+
         try:
             resp = await http_client.get(f"{base_url}/health", timeout=5.0)
             if resp.status_code == 200:
-                elapsed = timeout - (deadline - time.monotonic())
-                log.info("SGLang healthy after %.1fs", elapsed)
+                log.info("SGLang healthy after %.1fs", now - start)
+                if synthetic_job:
+                    synthetic_job.status = "done"
+                    synthetic_job.progress = 100.0
+                    synthetic_job.message += " — complete"
                 return True
         except Exception:
             pass
+
+        if container_name:
+            loop = asyncio.get_event_loop()
+            active = await loop.run_in_executor(
+                None, lambda: _container_has_recent_activity_sync(container_name)
+            )
+            if active:
+                last_activity = now
+                deadline = now + timeout
+
+                # On first activity, check if the container is downloading
+                if not download_checked:
+                    download_checked = True
+                    dl_model = await loop.run_in_executor(
+                        None, lambda: _detect_container_download_sync(container_name)
+                    )
+                    if dl_model:
+                        synthetic_job = _new_job("container-download")
+                        synthetic_job.status = "running"
+                        synthetic_job.container = container_name
+                        synthetic_job.message = f"Downloading {dl_model} (in-container: {container_name})"
+                        log.info(
+                            "Detected in-container download of '%s' — created job %s",
+                            dl_model, synthetic_job.id[:8],
+                        )
+            elif now - last_activity > STALL_TIMEOUT:
+                log.error(
+                    "Health poll: %s has been inactive for %.0fs — assuming stuck",
+                    container_name, now - last_activity,
+                )
+                if synthetic_job and synthetic_job.status == "running":
+                    synthetic_job.status = "failed"
+                    synthetic_job.message += " — container stalled"
+                return False
+
+        if now > deadline:
+            log.error("Health poll timed out after %.0fs", now - start)
+            if synthetic_job and synthetic_job.status == "running":
+                synthetic_job.status = "failed"
+                synthetic_job.message += " — timed out"
+            return False
+
         await asyncio.sleep(HEALTH_POLL_INTERVAL)
-    log.error("Health poll timed out after %.0fs", timeout)
-    return False
 
 # ---------------------------------------------------------------------------
 # Startup: detect already-running model
@@ -562,81 +843,215 @@ async def poll_health(base_url: str, timeout: float) -> bool:
 
 async def detect_running_model() -> Optional[str]:
     """
-    At startup, probe all configured service base URLs to find a running model.
-    Returns the config key of the first model found healthy, or None.
+    At startup, discover all running model containers via Docker and adopt
+    the best one.  Priority: healthy > downloading/loading > idle.
+    Orphaned containers that are stuck (running, no activity, not healthy)
+    are stopped.  A downloading container is adopted and gets a synthetic
+    job for Jobs-page visibility.
     """
-    checked: set[str] = set()
-    for key, info in MODELS_CFG.items():
-        url = info.get("base_url", SGLANG_BASE_URL)
-        if url in checked:
-            continue
-        checked.add(url)
+    running = await discover_running_containers()
+    if not running:
+        # Fallback: probe health endpoints (original behaviour for edge cases)
+        checked: set[str] = set()
+        for key, info in MODELS_CFG.items():
+            url = info.get("base_url", SGLANG_BASE_URL)
+            if url in checked:
+                continue
+            checked.add(url)
+            try:
+                resp = await http_client.get(f"{url}/v1/models", timeout=5.0)
+                if resp.status_code != 200:
+                    continue
+                data = resp.json().get("data", [])
+                if not data:
+                    continue
+                running_id = data[0].get("id", "")
+                detected_key = resolve_model(running_id)
+                if detected_key:
+                    log.info("Detected running model at %s: '%s' → config key '%s'", url, running_id, detected_key)
+                    return detected_key
+                else:
+                    log.warning("Running model '%s' at %s not in config (unmanaged)", running_id, url)
+            except Exception as e:
+                log.info("No model at %s (likely stopped): %s", url, e)
+        return None
+
+    log.info("Startup: found %d running model container(s): %s",
+             len(running), list(running.keys()))
+
+    # Classify running containers
+    healthy_key: Optional[str] = None
+    downloading_key: Optional[str] = None
+    idle_keys: list[str] = []
+
+    for key, info in running.items():
+        # Probe health endpoint
+        url = MODELS_CFG[key].get("base_url", SGLANG_BASE_URL)
         try:
-            resp = await http_client.get(f"{url}/v1/models", timeout=5.0)
-            if resp.status_code != 200:
+            resp = await http_client.get(f"{url}/health", timeout=5.0)
+            if resp.status_code == 200:
+                healthy_key = key
                 continue
-            data = resp.json().get("data", [])
-            if not data:
-                continue
-            running_id = data[0].get("id", "")
-            detected_key = resolve_model(running_id)
-            if detected_key:
-                log.info("Detected running model at %s: '%s' → config key '%s'", url, running_id, detected_key)
-                return detected_key
-            else:
-                log.warning("Running model '%s' at %s not in config (unmanaged)", running_id, url)
+        except Exception:
+            pass
+        # Not healthy — classify
+        if info["downloading"] or info["active_logs"]:
+            downloading_key = key
+        else:
+            idle_keys.append(key)
+
+    # Pick the best candidate to adopt
+    adopt_key = healthy_key or downloading_key
+    if adopt_key:
+        log.info("Startup: adopting '%s' as active model (healthy=%s)",
+                 adopt_key, adopt_key == healthy_key)
+
+    # Create synthetic job for downloading container
+    if adopt_key and adopt_key == downloading_key:
+        dl_model = None
+        loop = asyncio.get_event_loop()
+        dl_model = await loop.run_in_executor(
+            None, lambda: _detect_container_download_sync(running[adopt_key]["container"])
+        )
+        job = _new_job("container-download")
+        job.status = "running"
+        job.container = running[adopt_key]["container"]
+        job.message = f"Downloading {dl_model or 'model'} (in-container: {running[adopt_key]['container']})"
+        log.info("Startup: created synthetic download job %s for '%s'", job.id[:8], adopt_key)
+
+    # Stop orphaned containers (everything except the adopted one)
+    for key, info in running.items():
+        if key == adopt_key:
+            continue
+        cname = info["container"]
+        log.warning("Startup: stopping orphaned container %s ('%s')", cname, key)
+        try:
+            await stop_container(cname)
         except Exception as e:
-            log.info("No model at %s (likely stopped): %s", url, e)
-    return None
+            log.error("Startup: failed to stop orphan %s: %s", cname, e)
+
+    return adopt_key
 
 # ---------------------------------------------------------------------------
 # Core swap logic
 # ---------------------------------------------------------------------------
 
-async def _deactivate_current() -> None:
+async def _deactivate_current(force: bool = False, skip_key: str | None = None) -> None:
     """
     Internal: drain in-flight requests and stop the current single model.
     Must be called inside swap_lock.
-    Sets active_model = None on completion.
+
+    Also scans for orphaned containers (running but not tracked by active_model).
+    If an orphan is downloading and force=False, raises SwapBlockedError.
+
+    skip_key: do not stop this model (it's the swap target).
     """
     global active_model
-    if active_model is None:
-        return
-    current_cfg = MODELS_CFG[active_model]
-    await _drain_in_flight()
-    try:
-        await stop_container(container_name(current_cfg["service"]))
-    except Exception as e:
-        log.error("Failed to stop %s: %s", active_model, e)
-    active_model = None
+
+    # Stop the tracked active model (if any)
+    if active_model is not None:
+        if active_model == skip_key:
+            pass  # target model is already running — don't stop it
+        else:
+            # Check if the active model is downloading — protect it unless forced
+            # Skip check if the model is healthy (serving requests = not downloading)
+            if not force:
+                cname = container_name(MODELS_CFG[active_model]["service"])
+                # Direct probe — swap operations must not use stale cache
+                try:
+                    resp = await http_client.get(
+                        f"{model_base_url(active_model)}/health", timeout=3.0
+                    )
+                    is_healthy = resp.status_code == 200
+                except Exception:
+                    is_healthy = False
+                if not is_healthy:
+                    loop = asyncio.get_event_loop()
+                    dl = await loop.run_in_executor(
+                        None, lambda: _detect_container_download_sync(cname)
+                    )
+                    if dl:
+                        raise SwapBlockedError({
+                            "blocked_by": active_model,
+                            "container": cname,
+                            "reason": "downloading",
+                            "message": f"Cannot swap: active model '{active_model}' is downloading "
+                                       f"'{dl}'. Wait or force via ?force=true",
+                        })
+            current_cfg = MODELS_CFG[active_model]
+            await _drain_in_flight()
+            try:
+                await stop_container(container_name(current_cfg["service"]))
+            except Exception as e:
+                log.error("Failed to stop %s: %s", active_model, e)
+            active_model = None
+
+    # Scan for orphaned containers (running but not tracked)
+    running = await discover_running_containers()
+    for key, info in running.items():
+        if key == skip_key:
+            continue
+        if info["downloading"] and not force:
+            raise SwapBlockedError({
+                "blocked_by": key,
+                "container": info["container"],
+                "reason": "downloading",
+                "message": f"Cannot swap: '{key}' is downloading in {info['container']}. "
+                           f"Wait or force via ?force=true",
+            })
+        log.warning("Stopping orphaned container %s ('%s')", info["container"], key)
+        try:
+            await stop_container(info["container"])
+        except Exception as e:
+            log.error("Failed to stop orphan %s: %s", info["container"], e)
 
 
-async def _deactivate_current_set() -> None:
+async def _deactivate_current_set(force: bool = False, skip_key: str | None = None) -> None:
     """
     Internal: drain in-flight requests and stop all members of the current set.
     Must be called inside swap_lock.
-    Sets active_set = None on completion.
+
+    Also scans for orphans. If an orphan is downloading and force=False,
+    raises SwapBlockedError.
     """
     global active_set
-    if active_set is None:
-        return
-    members = SETS_CFG.get(active_set, {}).get("members", [])
-    await _drain_in_flight()
-    stop_tasks = []
-    for member_key in members:
-        if member_key not in MODELS_CFG:
+    if active_set is not None:
+        members = SETS_CFG.get(active_set, {}).get("members", [])
+        await _drain_in_flight()
+        stop_tasks = []
+        for member_key in members:
+            if member_key not in MODELS_CFG:
+                continue
+            cname = container_name(MODELS_CFG[member_key]["service"])
+            stop_tasks.append(stop_container(cname))
+        if stop_tasks:
+            results = await asyncio.gather(*stop_tasks, return_exceptions=True)
+            for r in results:
+                if isinstance(r, Exception):
+                    log.error("Error stopping set member: %s", r)
+        active_set = None
+
+    # Scan for orphans not covered by the set
+    running = await discover_running_containers()
+    for key, info in running.items():
+        if key == skip_key:
             continue
-        cname = container_name(MODELS_CFG[member_key]["service"])
-        stop_tasks.append(stop_container(cname))
-    if stop_tasks:
-        results = await asyncio.gather(*stop_tasks, return_exceptions=True)
-        for r in results:
-            if isinstance(r, Exception):
-                log.error("Error stopping set member: %s", r)
-    active_set = None
+        if info["downloading"] and not force:
+            raise SwapBlockedError({
+                "blocked_by": key,
+                "container": info["container"],
+                "reason": "downloading",
+                "message": f"Cannot swap: '{key}' is downloading in {info['container']}. "
+                           f"Wait or force via ?force=true",
+            })
+        log.warning("Stopping orphaned container %s ('%s')", info["container"], key)
+        try:
+            await stop_container(info["container"])
+        except Exception as e:
+            log.error("Failed to stop orphan %s: %s", info["container"], e)
 
 
-async def ensure_model(target_key: str) -> bool:
+async def ensure_model(target_key: str, force: bool = False) -> bool:
     """
     Ensure `target_key` is the active, healthy SGLang model.
 
@@ -644,6 +1059,8 @@ async def ensure_model(target_key: str) -> bool:
     and no swap pending, return True immediately.
     Slow path: acquire swap_lock, deactivate current model/set, activate target.
 
+    Raises SwapBlockedError if a different model is downloading and force=False.
+    Raises SwapBlockedError if a recent swap failure is still in cooldown.
     Returns True if the model is ready to serve, False on failure.
     """
     global active_model, active_set, swap_pending
@@ -657,6 +1074,20 @@ async def ensure_model(target_key: str) -> bool:
         set_members = SETS_CFG.get(active_set, {}).get("members", [])
         if target_key in set_members:
             return True
+
+    # Cooldown check — prevent rapid retry storms after failures
+    last_fail = _last_swap_failure.get(target_key)
+    if last_fail is not None and not force:
+        elapsed = time.monotonic() - last_fail
+        if elapsed < SWAP_FAILURE_COOLDOWN:
+            retry_after = SWAP_FAILURE_COOLDOWN - elapsed
+            raise SwapBlockedError({
+                "blocked_by": target_key,
+                "reason": "cooldown",
+                "retry_after_seconds": round(retry_after, 1),
+                "message": f"Swap to '{target_key}' failed recently. "
+                           f"Retry in {retry_after:.0f}s or use ?force=true",
+            })
 
     # Hold check — if the active model was used recently, wait before swapping
     if active_model is not None and active_model != target_key and MODEL_HOLD_SECONDS > 0:
@@ -691,9 +1122,14 @@ async def ensure_model(target_key: str) -> bool:
         target_url = model_base_url(target_key)
         start_timeout = float(target_cfg.get("health_timeout_start", 300))
 
-        # ── Step 1: Deactivate current model or set ───────────────────────
-        await _deactivate_current()      # no-op if active_model is None
-        await _deactivate_current_set()  # no-op if active_set is None
+        # ── Step 1: Deactivate current model/set + orphan scan ────────────
+        # skip_key=target_key so we don't stop the target if it's already running
+        try:
+            await _deactivate_current(force=force, skip_key=target_key)
+            await _deactivate_current_set(force=force, skip_key=target_key)
+        except SwapBlockedError:
+            swap_pending = False
+            raise  # propagate 409 to caller
 
         # ── Step 1b: RAM check ─────────────────────────────────────────────
         ram_required_gb = float(target_cfg.get("ram_required_gb", 0))
@@ -704,6 +1140,7 @@ async def ensure_model(target_key: str) -> bool:
                     "Insufficient RAM to load '%s': need %.1f GB, only %.1f GB available",
                     target_key, ram_required_gb, available_gb,
                 )
+                _last_swap_failure[target_key] = time.monotonic()
                 swap_pending = False
                 return False
             log.info("RAM check OK: need %.1f GB, %.1f GB available", ram_required_gb, available_gb)
@@ -715,19 +1152,19 @@ async def ensure_model(target_key: str) -> bool:
         healthy = False
 
         if status == "running":
-            healthy = await poll_health(target_url, start_timeout)
+            healthy = await poll_health(target_url, start_timeout, target_container)
             if not healthy:
                 log.info("Running but unhealthy — restarting %s", target_container)
                 try:
                     await restart_container(target_container)
-                    healthy = await poll_health(target_url, start_timeout)
+                    healthy = await poll_health(target_url, start_timeout, target_container)
                 except Exception as e:
                     log.error("Restart failed for %s: %s", target_container, e)
 
         elif status in ("exited", "created", "paused", "not_found"):
             try:
                 await start_container(target_container, target_service)
-                healthy = await poll_health(target_url, start_timeout)
+                healthy = await poll_health(target_url, start_timeout, target_container)
             except Exception as e:
                 log.error("Failed to start %s: %s", target_container, e)
 
@@ -737,21 +1174,24 @@ async def ensure_model(target_key: str) -> bool:
         # ── Step 3: Update state ───────────────────────────────────────────
         if healthy:
             active_model = target_key
+            _last_swap_failure.pop(target_key, None)
             log.info("─── Swap complete. Active: %s ───", target_key)
         else:
+            _last_swap_failure[target_key] = time.monotonic()
             log.error("Swap to %s FAILED — health check did not pass", target_key)
 
         swap_pending = False
         return healthy
 
 
-async def ensure_set(target_set_key: str) -> bool:
+async def ensure_set(target_set_key: str, force: bool = False) -> bool:
     """
     Ensure all members of `target_set_key` are active and healthy.
 
     Fast path: set already active and no swap pending → True immediately.
     Slow path: stop current model/set, start all members in parallel.
 
+    Raises SwapBlockedError if a container is downloading and force=False.
     Returns True if all members are healthy, False on failure.
     """
     global active_model, active_set, swap_pending
@@ -792,9 +1232,13 @@ async def ensure_set(target_set_key: str) -> bool:
             log.info("RAM check OK for set '%s': need %.1f GB, %.1f GB available",
                      target_set_key, total_ram, available_gb)
 
-        # ── Deactivate current state ───────────────────────────────────────
-        await _deactivate_current()
-        await _deactivate_current_set()
+        # ── Deactivate current state + orphan scan ─────────────────────────
+        try:
+            await _deactivate_current(force=force)
+            await _deactivate_current_set(force=force)
+        except SwapBlockedError:
+            swap_pending = False
+            raise
 
         # ── Start all members in parallel ─────────────────────────────────
         async def _start_member(member_key: str) -> bool:
@@ -806,7 +1250,7 @@ async def ensure_set(target_set_key: str) -> bool:
             try:
                 await start_container(cname, info["service"])
                 start_timeout = float(info.get("health_timeout_start", 300))
-                return await poll_health(model_base_url(member_key), start_timeout)
+                return await poll_health(model_base_url(member_key), start_timeout, cname)
             except Exception as e:
                 log.error("Failed to start set member '%s': %s", member_key, e)
                 return False
@@ -829,16 +1273,15 @@ async def ensure_set(target_set_key: str) -> bool:
 # Routing helper
 # ---------------------------------------------------------------------------
 
-async def resolve_and_ensure(model_field: str) -> tuple[bool, Optional[str]]:
+async def resolve_and_ensure(model_field: str) -> tuple[bool, Optional[str], Optional[dict]]:
     """
     Given a model field from a request body, ensure the right model/set is active.
-    Returns (ready: bool, base_url: str | None).
+    Returns (ready, base_url, block_info).  block_info is None on success or a
+    dict with error details when a swap was blocked (download in progress, cooldown).
 
     Priority:
       1. Direct model alias → load single model
-         Fast path if it's the active single model, or a member of the active set.
       2. Set alias → load all set members
-         Fast path if the set is already active.
       3. Unknown → route to whatever is currently active.
     """
     if model_field:
@@ -847,14 +1290,17 @@ async def resolve_and_ensure(model_field: str) -> tuple[bool, Optional[str]]:
         if model_key:
             # Fast path: single model active
             if active_model == model_key and not swap_pending:
-                return True, model_base_url(model_key)
+                return True, model_base_url(model_key), None
             # Fast path: model is a member of the active set
             if active_set is not None and not swap_pending:
                 if model_key in SETS_CFG.get(active_set, {}).get("members", []):
-                    return True, model_base_url(model_key)
+                    return True, model_base_url(model_key), None
             # Need to load
-            ready = await ensure_model(model_key)
-            return ready, model_base_url(model_key)
+            try:
+                ready = await ensure_model(model_key)
+                return ready, model_base_url(model_key), None
+            except SwapBlockedError as e:
+                return False, None, e.details
 
         # Check set alias
         set_key = SET_ALIAS_MAP.get(model_field)
@@ -862,26 +1308,29 @@ async def resolve_and_ensure(model_field: str) -> tuple[bool, Optional[str]]:
             if active_set == set_key and not swap_pending:
                 members = SETS_CFG[set_key].get("members", [])
                 primary = SETS_CFG[set_key].get("primary") or (members[0] if members else None)
-                return True, model_base_url(primary) if primary else None
-            ready = await ensure_set(set_key)
+                return True, model_base_url(primary) if primary else None, None
+            try:
+                ready = await ensure_set(set_key)
+            except SwapBlockedError as e:
+                return False, None, e.details
             if ready:
                 members = SETS_CFG[set_key].get("members", [])
                 primary = SETS_CFG[set_key].get("primary") or (members[0] if members else None)
-                return ready, model_base_url(primary) if primary else None
-            return False, None
+                return ready, model_base_url(primary) if primary else None, None
+            return False, None, None
 
         # Unknown model field — log and fall through to active model
         log.warning("Unknown model '%s' in request — routing to currently active model", model_field)
 
     # No model field or unknown — use whatever is active
     if active_model:
-        return True, model_base_url(active_model)
+        return True, model_base_url(active_model), None
     if active_set:
         members = SETS_CFG.get(active_set, {}).get("members", [])
         primary = SETS_CFG[active_set].get("primary") or (members[0] if members else None)
-        return True, model_base_url(primary) if primary else None
+        return True, model_base_url(primary) if primary else None, None
 
-    return False, None
+    return False, None, None
 
 # ---------------------------------------------------------------------------
 # Proxy
@@ -997,11 +1446,18 @@ async def lifespan(app: FastAPI):
     default_key = ROUTER_CFG.get("default_model")
     if active_model is None and default_key and default_key in MODELS_CFG:
         log.info("No model detected at startup — pre-warming default model '%s'", default_key)
-        ready = await ensure_model(default_key)
-        if ready:
-            log.info("Pre-warm complete — '%s' is healthy and ready", default_key)
-        else:
-            log.warning("Pre-warm failed for '%s' — router is up but model not active", default_key)
+        try:
+            ready = await ensure_model(default_key)
+            if ready:
+                log.info("Pre-warm complete — '%s' is healthy and ready", default_key)
+            else:
+                log.warning("Pre-warm failed for '%s' — router is up but model not active", default_key)
+        except SwapBlockedError as e:
+            log.info("Pre-warm skipped: %s", e.details.get("message", str(e)))
+
+    # Start background health poller
+    asyncio.create_task(_background_health_poller())
+    log.info("Background health poller started (interval=%.0fs)", POLLER_INTERVAL)
 
     log.info("Startup complete — active model: %s", active_model or "none")
 
@@ -1093,14 +1549,17 @@ async def system_info():
 
 
 @app.post("/router/swap/{model_key}")
-async def manual_swap(model_key: str):
+async def manual_swap(model_key: str, force: bool = False):
     """Manually trigger a model swap without sending an inference request."""
     canonical = resolve_model(model_key)
     if canonical is None:
         # Try set
         set_key = SET_ALIAS_MAP.get(model_key)
         if set_key:
-            success = await ensure_set(set_key)
+            try:
+                success = await ensure_set(set_key, force=force)
+            except SwapBlockedError as e:
+                return JSONResponse(status_code=409, content={"error": e.details})
             if success:
                 return {"status": "ok", "active_set": active_set}
             return JSONResponse(status_code=503, content={"error": f"Set swap to '{set_key}' failed"})
@@ -1109,7 +1568,10 @@ async def manual_swap(model_key: str):
             content={"error": f"Unknown model/set '{model_key}'. "
                      f"Available models: {list(MODELS_CFG.keys())}, sets: {list(SETS_CFG.keys())}"},
         )
-    success = await ensure_model(canonical)
+    try:
+        success = await ensure_model(canonical, force=force)
+    except SwapBlockedError as e:
+        return JSONResponse(status_code=409, content={"error": e.details})
     if success:
         return {"status": "ok", "active_model": active_model}
     return JSONResponse(
@@ -1196,11 +1658,20 @@ async def remove_hf_token():
 
 @app.get("/router/models")
 async def router_list_models():
-    """List all registered models with container status."""
+    """List all registered models with container status, health, and download state.
+    Reads from background poller cache — no direct health probes."""
     result = []
     for key, info in MODELS_CFG.items():
-        cname = container_name(info["service"])
-        cstatus = await container_status(cname)
+        cached = get_cached_model_state(key)
+        if cached:
+            cstatus = cached["container_status"]
+            healthy = cached["healthy"]
+            downloading = cached["downloading"]
+        else:
+            cname = container_name(info["service"])
+            cstatus = await container_status(cname)
+            healthy = False
+            downloading = False
         result.append({
             "key": key,
             "service": info["service"],
@@ -1213,6 +1684,8 @@ async def router_list_models():
                 key in SETS_CFG.get(active_set, {}).get("members", [])
             ),
             "container_status": cstatus,
+            "healthy": healthy,
+            "downloading": downloading,
         })
     return {"models": result}
 
@@ -1273,15 +1746,16 @@ async def install_model(request: Request):
 
     # Auto-generate compose service from backend template if not explicitly provided
     image_override = body.get("image", "")
+    command_override = body.get("command", "")
     if not compose_service_def and backend in BACKEND_TEMPLATES and model_path:
         try:
-            compose_service_def = _build_compose_service(backend, model_path, image_override)
+            compose_service_def = _build_compose_service(backend, model_path, image_override, command_override)
         except ValueError as e:
             return JSONResponse(status_code=400, content={"error": str(e)})
 
     # Build the registration closure (compose + config writes)
     model_entry = {k: v for k, v in body.items()
-                   if k not in ("key", "compose_service", "download")}
+                   if k not in ("key", "compose_service", "download", "command", "image")}
 
     def _register_model():
         """Write compose service + config entry. Called immediately or after download."""
@@ -1412,44 +1886,62 @@ async def model_status_detail(key: str):
 # ---------------------------------------------------------------------------
 
 @app.post("/router/models/{key}/start")
-async def model_start(key: str):
-    """Cold-start a model container and wait for it to be healthy."""
+async def model_start(key: str, force: bool = False):
+    """Start a model — uses ensure_model() for proper state management.
+
+    This deactivates the current model (with orphan scan), checks RAM,
+    starts the target, and updates active_model on success.
+    """
     canonical = resolve_model(key)
     if not canonical:
         return JSONResponse(status_code=404, content={"error": f"Unknown model '{key}'"})
-    info = MODELS_CFG[canonical]
-    ram_required = float(info.get("ram_required_gb", 0))
-    if ram_required > 0:
-        available = _available_ram_gb()
-        if available < ram_required:
-            return JSONResponse(status_code=507, content={
-                "error": f"Insufficient RAM: need {ram_required}GB, {available:.1f}GB available"
-            })
-    cname = container_name(info["service"])
-
     try:
-        await start_container(cname, info["service"])
-        start_timeout = float(info.get("health_timeout_start", 300))
-        healthy = await poll_health(model_base_url(canonical), start_timeout)
-        if healthy:
-            return {"status": "ok", "key": canonical, "container": cname}
-        return JSONResponse(status_code=503, content={"error": "Container started but health check timed out"})
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
+        success = await ensure_model(canonical, force=force)
+    except SwapBlockedError as e:
+        return JSONResponse(status_code=409, content={"error": e.details})
+    if success:
+        cname = container_name(MODELS_CFG[canonical]["service"])
+        return {"status": "ok", "key": canonical, "container": cname}
+    return JSONResponse(status_code=503, content={"error": f"Model '{canonical}' failed to start — check router logs"})
 
 
 @app.post("/router/models/{key}/stop")
-async def model_stop(key: str):
-    """Stop a model container, draining in-flight requests if it is active."""
+async def model_stop(key: str, force: bool = False):
+    """Stop a model container, draining in-flight requests if it is active.
+
+    If the container is downloading and force=False, returns 409.
+    Use ?force=true to stop a downloading container.
+    """
     global active_model
     canonical = resolve_model(key)
     if not canonical:
         return JSONResponse(status_code=404, content={"error": f"Unknown model '{key}'"})
     info = MODELS_CFG[canonical]
     cname = container_name(info["service"])
+
+    # Check if downloading — protect unless forced
+    if not force:
+        status = await container_status(cname)
+        if status == "running":
+            loop = asyncio.get_event_loop()
+            dl_model = await loop.run_in_executor(
+                None, lambda: _detect_container_download_sync(cname)
+            )
+            if dl_model:
+                return JSONResponse(status_code=409, content={
+                    "error": {
+                        "message": f"Model '{canonical}' is downloading ({dl_model}). Use ?force=true to stop.",
+                        "type": "download_protected",
+                        "blocked_by": canonical,
+                    }
+                })
+
     if canonical == active_model:
         await _drain_in_flight()
         active_model = None
+
+    # Clear cooldown for all models (system state changed)
+    _last_swap_failure.clear()
 
     try:
         await stop_container(cname)
@@ -1465,7 +1957,23 @@ async def model_stop(key: str):
 
 @app.get("/router/jobs")
 async def list_jobs():
-    """List all jobs (HF downloads, etc.)."""
+    """List all jobs. Reconciles synthetic job status with actual container state."""
+    for job in JOB_REGISTRY.values():
+        if job.status != "running" or not job.container:
+            continue
+        # Validate container-download / image-pull jobs against real state
+        try:
+            cstatus = await container_status(job.container)
+            if cstatus != "running":
+                job.status = "failed"
+                job.message += f" — container {cstatus}"
+            elif not _detect_container_download_sync(job.container):
+                # Container is running but no longer downloading — done
+                job.status = "done"
+                job.progress = 100.0
+                job.message += " — complete"
+        except Exception:
+            pass
     return {"jobs": [j.to_dict() for j in JOB_REGISTRY.values()]}
 
 
@@ -1497,14 +2005,39 @@ async def get_job(job_id: str):
 
 @app.post("/router/jobs/{job_id}/cancel")
 async def cancel_job(job_id: str):
-    """Request cancellation of a running job."""
+    """Cancel a running job. For container-download and image-pull jobs,
+    also force-stops the associated container."""
+    global active_model
     job = JOB_REGISTRY.get(job_id)
     if not job:
         return JSONResponse(status_code=404, content={"error": f"Job '{job_id}' not found"})
     if job.status not in ("pending", "running"):
         return JSONResponse(status_code=409, content={"error": f"Job is already '{job.status}'"})
+
     job.cancel_event.set()
-    return {"status": "ok", "job_id": job_id, "message": "Cancellation requested"}
+    job.status = "cancelled"
+    job.message += " — cancelled"
+
+    # For synthetic jobs with an associated container, force-stop it
+    container_stopped = None
+    if job.container:
+        try:
+            await stop_container(job.container)
+            container_stopped = job.container
+            # Clear active_model if this container was the active model
+            for key, info in MODELS_CFG.items():
+                if container_name(info["service"]) == job.container and key == active_model:
+                    active_model = None
+                    break
+            _last_swap_failure.clear()
+        except Exception as e:
+            log.error("Failed to stop container %s for cancelled job: %s", job.container, e)
+
+    return {
+        "status": "ok",
+        "job_id": job_id,
+        "message": "Job cancelled" + (f", container {container_stopped} stopped" if container_stopped else ""),
+    }
 
 
 @app.delete("/router/jobs/{job_id}")
@@ -1641,13 +2174,35 @@ async def set_start(key: str):
 
 
 @app.post("/router/sets/{key}/stop")
-async def set_stop(key: str):
-    """Stop all members of a set."""
+async def set_stop(key: str, force: bool = False):
+    """Stop all members of a set. Returns 409 if any member is downloading."""
     global active_set
     set_key = SET_ALIAS_MAP.get(key, key)
     if set_key not in SETS_CFG:
         return JSONResponse(status_code=404, content={"error": f"Set '{key}' not found"})
     members = SETS_CFG[set_key].get("members", [])
+
+    # Check if any member is downloading
+    if not force:
+        for m in members:
+            if m not in MODELS_CFG:
+                continue
+            cname = container_name(MODELS_CFG[m]["service"])
+            status = await container_status(cname)
+            if status == "running":
+                loop = asyncio.get_event_loop()
+                dl = await loop.run_in_executor(
+                    None, lambda cn=cname: _detect_container_download_sync(cn)
+                )
+                if dl:
+                    return JSONResponse(status_code=409, content={
+                        "error": {
+                            "message": f"Set member '{m}' is downloading ({dl}). Use ?force=true to stop.",
+                            "type": "download_protected",
+                            "blocked_by": m,
+                        }
+                    })
+
     if set_key == active_set:
         await _drain_in_flight()
     errors = []
@@ -1661,6 +2216,7 @@ async def set_stop(key: str):
             errors.append({"member": m, "error": str(e)})
     if set_key == active_set:
         active_set = None
+    _last_swap_failure.clear()
     if errors:
         return JSONResponse(status_code=207, content={"status": "partial", "errors": errors})
     return {"status": "ok", "key": set_key}
@@ -1692,7 +2248,7 @@ async def update_set(key: str, request: Request):
 
 @app.get("/router/services")
 async def list_services():
-    """List all services defined in compose.yaml with their container status."""
+    """List all services defined in compose.yaml with container status, health, and download state."""
     try:
         with open(COMPOSE_PATH) as f:
             compose = yaml.safe_load(f)
@@ -1703,11 +2259,26 @@ async def list_services():
         if not svc_def:
             continue
         cname = container_name(svc_name)
-        cstatus = await container_status(cname)
+        # Try poller cache first
+        healthy = False
+        downloading = False
+        cstatus = None
+        for key, info in MODELS_CFG.items():
+            if info["service"] == svc_name:
+                cached = get_cached_model_state(key)
+                if cached:
+                    cstatus = cached["container_status"]
+                    healthy = cached["healthy"]
+                    downloading = cached["downloading"]
+                break
+        if cstatus is None:
+            cstatus = await container_status(cname)
         result.append({
             "service": svc_name,
             "container": cname,
             "status": cstatus,
+            "healthy": healthy,
+            "downloading": downloading,
             "profiles": (svc_def or {}).get("profiles", []),
             "image": (svc_def or {}).get("image", "<build>"),
         })
@@ -1715,8 +2286,24 @@ async def list_services():
 
 
 @app.post("/router/services/{service}/start")
-async def service_start(service: str):
-    """Start a compose service (docker compose up --no-deps)."""
+async def service_start(service: str, force: bool = False):
+    """Start a compose service (docker compose up --no-deps).
+
+    If another model is currently downloading and force=False, returns 409.
+    """
+    # Check if any model container is downloading
+    if not force:
+        running = await discover_running_containers()
+        for key, info in running.items():
+            if info["downloading"]:
+                return JSONResponse(status_code=409, content={
+                    "error": {
+                        "message": f"Model '{key}' is downloading in {info['container']}. "
+                                   f"Use ?force=true to start anyway.",
+                        "type": "download_protected",
+                        "blocked_by": key,
+                    }
+                })
     try:
         await _compose_up_service(service)
         return {"status": "ok", "service": service}
@@ -1725,23 +2312,56 @@ async def service_start(service: str):
 
 
 @app.post("/router/services/{service}/stop")
-async def service_stop(service: str):
-    """Stop a compose service container."""
+async def service_stop(service: str, force: bool = False):
+    """Stop a compose service container. Returns 409 if downloading."""
     cname = container_name(service)
     cstatus = await container_status(cname)
     if cstatus == "not_found":
         return JSONResponse(status_code=404, content={"error": f"Container '{cname}' not found"})
+
+    if not force and cstatus == "running":
+        loop = asyncio.get_event_loop()
+        dl = await loop.run_in_executor(
+            None, lambda: _detect_container_download_sync(cname)
+        )
+        if dl:
+            return JSONResponse(status_code=409, content={
+                "error": {
+                    "message": f"Service '{service}' is downloading ({dl}). Use ?force=true to stop.",
+                    "type": "download_protected",
+                    "blocked_by": service,
+                }
+            })
+
     try:
         await stop_container(cname)
+        _last_swap_failure.clear()
         return {"status": "ok", "service": service}
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 
 @app.post("/router/services/{service}/restart")
-async def service_restart(service: str):
-    """Restart a compose service container."""
+async def service_restart(service: str, force: bool = False):
+    """Restart a compose service container. Returns 409 if downloading."""
     cname = container_name(service)
+
+    if not force:
+        cstatus = await container_status(cname)
+        if cstatus == "running":
+            loop = asyncio.get_event_loop()
+            dl = await loop.run_in_executor(
+                None, lambda: _detect_container_download_sync(cname)
+            )
+            if dl:
+                return JSONResponse(status_code=409, content={
+                    "error": {
+                        "message": f"Service '{service}' is downloading ({dl}). Use ?force=true to restart.",
+                        "type": "download_protected",
+                        "blocked_by": service,
+                    }
+                })
+
     try:
         await restart_container(cname)
         return {"status": "ok", "service": service}
@@ -1855,9 +2475,18 @@ async def proxy_v1(request: Request, path: str):
         except (json.JSONDecodeError, AttributeError):
             pass
 
-    ready, base_url = await resolve_and_ensure(model_field)
+    ready, base_url, block_info = await resolve_and_ensure(model_field)
 
     if not ready:
+        if block_info:
+            return JSONResponse(
+                status_code=409,
+                content={"error": {
+                    "message": block_info.get("message", "Swap blocked"),
+                    "type": "swap_blocked",
+                    "details": block_info,
+                }},
+            )
         if base_url is None and active_model is None and active_set is None:
             return JSONResponse(
                 status_code=503,
@@ -1920,9 +2549,18 @@ async def proxy_passthrough(request: Request, path: str):
             except (json.JSONDecodeError, AttributeError):
                 pass
 
-        ready, base_url = await resolve_and_ensure(model_field)
+        ready, base_url, block_info = await resolve_and_ensure(model_field)
 
         if not ready:
+            if block_info:
+                return JSONResponse(
+                    status_code=409,
+                    content={"error": {
+                        "message": block_info.get("message", "Swap blocked"),
+                        "type": "swap_blocked",
+                        "details": block_info,
+                    }},
+                )
             if base_url is None and active_model is None and active_set is None:
                 return JSONResponse(
                     status_code=503,
