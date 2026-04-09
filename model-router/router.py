@@ -101,6 +101,7 @@ def _load_config() -> None:
     """Load (or reload) config.yaml into module-level state."""
     global ROUTER_CFG, MODELS_CFG, SETS_CFG, SGLANG_BASE_URL, HEALTH_POLL_INTERVAL
     global DRAIN_TIMEOUT, MODEL_HOLD_SECONDS, COMPOSE_PROJECT, ALIAS_MAP, SET_ALIAS_MAP
+    global routing_locked
     with open(CONFIG_PATH) as f:
         _cfg = yaml.safe_load(f)
     ROUTER_CFG = _cfg.get("router", {})
@@ -111,6 +112,7 @@ def _load_config() -> None:
     DRAIN_TIMEOUT = float(ROUTER_CFG.get("in_flight_drain_timeout", 120))
     MODEL_HOLD_SECONDS = float(ROUTER_CFG.get("model_hold_seconds", 15))
     COMPOSE_PROJECT = ROUTER_CFG.get("compose_project", "gollm")
+    routing_locked = bool(ROUTER_CFG.get("routing_locked", False))
     new_alias_map: dict[str, str] = {}
     for _key, _info in MODELS_CFG.items():
         new_alias_map[_key] = _key
@@ -430,7 +432,7 @@ in_flight_zero = asyncio.Event()      # set when in_flight == 0
 in_flight_zero.set()
 
 swap_lock = asyncio.Lock()            # serialises all swap operations
-routing_locked: bool = False          # when True, inference requests don't trigger swaps
+routing_locked: bool                  # set by _load_config() from config.yaml
 
 _last_swap_failure: dict[str, float] = {}   # model_key -> monotonic time of last failure
 SWAP_FAILURE_COOLDOWN: float = 30.0         # seconds to wait before retrying a failed swap
@@ -731,7 +733,7 @@ def _detect_container_download_sync(cname: str) -> str | None:
             model_path = info.get("model_path")
             break
 
-    # Check container logs for state — loading weights means download is done
+    # Check container logs for state — certain log patterns prove download is done
     try:
         logs = container.logs(tail=50).decode("utf-8", errors="replace")
         logs_lower = logs.lower()
@@ -739,8 +741,10 @@ def _detect_container_download_sync(cname: str) -> str | None:
         if ("loading" in logs_lower and ("safetensors" in logs_lower or "checkpoint" in logs_lower
                 or "weight" in logs_lower or "shard" in logs_lower)):
             return None
-        # If the server is already serving, download is definitely done
+        # If the server is already serving (health probes succeeding), download is done
         if "uvicorn running" in logs_lower or "server started" in logs_lower:
+            return None
+        if '/health" 200' in logs or "/health HTTP/1.1\" 200" in logs:
             return None
     except Exception:
         pass
@@ -1544,11 +1548,19 @@ async def get_routing_lock():
 
 @app.post("/router/routing-lock")
 async def set_routing_lock(request: Request):
-    """Toggle routing lock. When locked, inference requests don't trigger model swaps."""
+    """Toggle routing lock. When locked, inference requests don't trigger model swaps.
+    Persists to config.yaml so the setting survives router restarts."""
     global routing_locked
     body = await request.json()
     routing_locked = bool(body.get("locked", False))
     log.info("Routing lock %s", "ENABLED" if routing_locked else "DISABLED")
+    # Persist to config
+    try:
+        cfg = _read_raw_config()
+        cfg.setdefault("router", {})["routing_locked"] = routing_locked
+        _save_config(cfg)
+    except Exception as e:
+        log.warning("Failed to persist routing_locked: %s", e)
     return {"locked": routing_locked}
 
 
