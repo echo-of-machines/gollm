@@ -530,10 +530,11 @@ async function refreshJobs() {
         <div style="background:var(--surface3);border:1px solid var(--border);border-radius:6px;padding:.4rem .7rem;font-size:.72rem;color:var(--text-dim)">Check terminal below for details</div>
         ` : ''}
         ${j.result ? `<div class="card-meta"><span class="meta-item card-subtitle">${esc(j.result.local_path || JSON.stringify(j.result))}</span></div>` : ''}
-        ${isActive ? `
         <div class="card-actions">
-          ${actionBtn('Terminate', 'cancel', `terminateJob('${j.id}')`)}
-        </div>` : ''}
+          ${isActive
+            ? actionBtn('Terminate', 'cancel', `terminateJob('${j.id}')`)
+            : actionBtn('Dismiss', 'trash', `dismissJob('${j.id}')`)}
+        </div>
       </div>`;
     }).join('');
   } catch (e) {
@@ -544,6 +545,11 @@ async function refreshJobs() {
 async function terminateJob(id) {
   if (!confirm('Terminate this job?')) return;
   try { await POST(`/router/jobs/${id}/cancel`); toast('Job terminated', 'ok'); refreshJobs(); }
+  catch (e) { toast(e.message, 'err'); }
+}
+
+async function dismissJob(id) {
+  try { await DELETE(`/router/jobs/${id}`); refreshJobs(); }
   catch (e) { toast(e.message, 'err'); }
 }
 

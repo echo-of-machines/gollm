@@ -730,9 +730,23 @@ def _detect_container_download_sync(cname: str) -> str | None:
             model_path = info.get("model_path")
             break
 
+    # Check container logs for state — loading weights means download is done
+    try:
+        logs = container.logs(tail=50).decode("utf-8", errors="replace")
+        logs_lower = logs.lower()
+        # If the model is loading weights, the download phase is complete
+        if ("loading" in logs_lower and ("safetensors" in logs_lower or "checkpoint" in logs_lower
+                or "weight" in logs_lower or "shard" in logs_lower)):
+            return None
+        # If the server is already serving, download is definitely done
+        if "uvicorn running" in logs_lower or "server started" in logs_lower:
+            return None
+    except Exception:
+        pass
+
     if model_path:
-        # Primary: check HF cache — if not cached and container is running,
-        # it must be downloading
+        # Check HF cache — if not cached and container is running,
+        # it's likely downloading (but log check above takes priority)
         if not _is_model_cached_sync(model_path):
             return model_path
 
@@ -2259,12 +2273,14 @@ async def list_services():
         if not svc_def:
             continue
         cname = container_name(svc_name)
-        # Try poller cache first
+        # Try poller cache for model services
         healthy = False
         downloading = False
         cstatus = None
+        is_model_service = False
         for key, info in MODELS_CFG.items():
             if info["service"] == svc_name:
+                is_model_service = True
                 cached = get_cached_model_state(key)
                 if cached:
                     cstatus = cached["container_status"]
@@ -2273,6 +2289,9 @@ async def list_services():
                 break
         if cstatus is None:
             cstatus = await container_status(cname)
+        # Non-model services (e.g. model-router): if running, they're ready
+        if not is_model_service and cstatus == "running":
+            healthy = True
         result.append({
             "service": svc_name,
             "container": cname,
