@@ -61,7 +61,7 @@ cp .env.example .env
 # 3. Start GoLLM
 docker compose up -d --build model-router
 
-# 4. Open the GUI
+# 4. Open the GUI and install your first model
 xdg-open http://localhost:30000/ui/   # Linux
 open http://localhost:30000/ui/        # macOS
 ```
