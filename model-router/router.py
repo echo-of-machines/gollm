@@ -430,6 +430,7 @@ in_flight_zero = asyncio.Event()      # set when in_flight == 0
 in_flight_zero.set()
 
 swap_lock = asyncio.Lock()            # serialises all swap operations
+routing_locked: bool = False          # when True, inference requests don't trigger swaps
 
 _last_swap_failure: dict[str, float] = {}   # model_key -> monotonic time of last failure
 SWAP_FAILURE_COOLDOWN: float = 30.0         # seconds to wait before retrying a failed swap
@@ -1309,6 +1310,16 @@ async def resolve_and_ensure(model_field: str) -> tuple[bool, Optional[str], Opt
             if active_set is not None and not swap_pending:
                 if model_key in SETS_CFG.get(active_set, {}).get("members", []):
                     return True, model_base_url(model_key), None
+            # Routing lock: route to active model instead of swapping
+            if routing_locked and (active_model or active_set):
+                log.debug("Routing locked — routing '%s' to active model '%s'",
+                          model_field, active_model or f"set:{active_set}")
+                if active_model:
+                    return True, model_base_url(active_model), None
+                if active_set:
+                    members = SETS_CFG.get(active_set, {}).get("members", [])
+                    primary = SETS_CFG[active_set].get("primary") or (members[0] if members else None)
+                    return True, model_base_url(primary) if primary else None, None
             # Need to load
             try:
                 ready = await ensure_model(model_key)
@@ -1323,6 +1334,16 @@ async def resolve_and_ensure(model_field: str) -> tuple[bool, Optional[str], Opt
                 members = SETS_CFG[set_key].get("members", [])
                 primary = SETS_CFG[set_key].get("primary") or (members[0] if members else None)
                 return True, model_base_url(primary) if primary else None, None
+            # Routing lock: route to active model instead of swapping
+            if routing_locked and (active_model or active_set):
+                log.debug("Routing locked — routing set '%s' to active model '%s'",
+                          model_field, active_model or f"set:{active_set}")
+                if active_model:
+                    return True, model_base_url(active_model), None
+                if active_set:
+                    members = SETS_CFG.get(active_set, {}).get("members", [])
+                    primary = SETS_CFG[active_set].get("primary") or (members[0] if members else None)
+                    return True, model_base_url(primary) if primary else None, None
             try:
                 ready = await ensure_set(set_key)
             except SwapBlockedError as e:
@@ -1507,7 +1528,28 @@ async def favicon():
 @app.get("/health")
 async def health():
     """Router liveness — always 200 if the router process is alive."""
-    return {"status": "ok", "active_model": active_model, "active_set": active_set}
+    return {
+        "status": "ok",
+        "active_model": active_model,
+        "active_set": active_set,
+        "routing_locked": routing_locked,
+    }
+
+
+@app.get("/router/routing-lock")
+async def get_routing_lock():
+    """Get current routing lock state."""
+    return {"locked": routing_locked}
+
+
+@app.post("/router/routing-lock")
+async def set_routing_lock(request: Request):
+    """Toggle routing lock. When locked, inference requests don't trigger model swaps."""
+    global routing_locked
+    body = await request.json()
+    routing_locked = bool(body.get("locked", False))
+    log.info("Routing lock %s", "ENABLED" if routing_locked else "DISABLED")
+    return {"locked": routing_locked}
 
 
 @app.get("/status")
@@ -1516,6 +1558,7 @@ async def status():
     return {
         "active_model": active_model,
         "active_set": active_set,
+        "routing_locked": routing_locked,
         "swap_pending": swap_pending,
         "in_flight": in_flight,
         "models": {
@@ -1555,6 +1598,7 @@ async def system_info():
         "active_model": active_model,
         "active_set": active_set,
         "swap_pending": swap_pending,
+        "routing_locked": routing_locked,
         "in_flight": in_flight,
         "jobs": job_counts,
         "model_count": len(MODELS_CFG),

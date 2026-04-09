@@ -55,6 +55,23 @@ header {
 .header-left { display: flex; align-items: center; gap: .75rem; }
 .header-right { display: flex; align-items: center; gap: 1rem; }
 
+/* Routing lock toggle */
+.routing-toggle { display: flex; align-items: center; gap: .4rem; cursor: pointer; user-select: none; }
+.routing-label { color: var(--text-sec); font-size: .72rem; white-space: nowrap; }
+.routing-toggle input { display: none; }
+.toggle-slider {
+  position: relative; width: 32px; height: 18px;
+  background: var(--surface3); border-radius: 9px;
+  transition: background .2s;
+}
+.toggle-slider::after {
+  content: ''; position: absolute; top: 2px; left: 2px;
+  width: 14px; height: 14px; background: var(--text-dim);
+  border-radius: 50%; transition: transform .2s, background .2s;
+}
+.routing-toggle input:checked + .toggle-slider { background: var(--green-dim); }
+.routing-toggle input:checked + .toggle-slider::after { transform: translateX(14px); background: var(--green); }
+
 .logo {
   font-weight: 700;
   font-size: .95rem;

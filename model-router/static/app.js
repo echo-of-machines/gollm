@@ -123,6 +123,12 @@ async function refreshSystem() {
       badge.innerHTML = 'idle';
     }
 
+    // Sync routing lock toggle from server state
+    const lockToggle = document.getElementById('routing-lock-toggle');
+    if (lockToggle && s.routing_locked !== undefined) {
+      lockToggle.checked = !s.routing_locked;  // checked = auto-routing ON = not locked
+    }
+
     const pct = s.ram_total_gb > 0 ? (s.ram_used_gb / s.ram_total_gb) * 100 : 0;
     const fill = document.getElementById('ram-bar-fill');
     fill.style.width = pct.toFixed(1) + '%';
@@ -589,6 +595,14 @@ async function refreshServices() {
 
 // Cache last system state for RAM display in confirmation
 let _lastSystem = null;
+
+// ── Routing lock toggle ───────────────────────────────────────────────────────
+async function toggleRoutingLock(autoRoutingOn) {
+  try {
+    await POST('/router/routing-lock', { locked: !autoRoutingOn });
+    toast(autoRoutingOn ? 'Auto-routing enabled' : 'Auto-routing disabled — model locked', 'ok');
+  } catch (e) { toast(e.message, 'err'); }
+}
 
 // Generic warning modal — replaces native confirm() for consistent UI
 function showWarnModal(title, message, btnLabel, onConfirm) {
